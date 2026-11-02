@@ -11,9 +11,9 @@ A personal command center for tasks, projects, recurring responsibilities, ideas
 | Phase | What it adds | Status |
 | --- | --- | --- |
 | 0 | Clickable mockup | Done |
-| 1 | Login, PIN lock, capture, lists, edit panel with type picker, status buttons, recurring "Done this cycle", iPhone Shortcut | This release |
-| 2 | Today's pad with carry-over, daily notes, Clear completed | Next |
-| 3 | Full project pages with inline task editing and the activity log | Planned |
+| 1 | Login, PIN lock, capture, lists, edit panel with type picker, status buttons, recurring "Done this cycle", iPhone Shortcut | Done |
+| 2 | Today's pad with carry-over, daily notes, Clear completed, Work area, quick details (`fri !high #home`) when capturing | This release |
+| 3 | Full project pages with inline task editing and the activity log | Next |
 | 4 | Google Calendar both ways | Planned |
 
 ## One-time setup
@@ -44,6 +44,10 @@ Do the same on each laptop's browser. Each device has its own PIN.
 ### 5. Add the "Jot it" Shortcut
 
 Follow [docs/SHORTCUT.md](docs/SHORTCUT.md).
+
+## Updating
+
+When a release changes `supabase/schema.sql`, paste the whole file into the SQL Editor and run it again. It keeps your data.
 
 ## How the PIN works
 

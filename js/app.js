@@ -1,12 +1,13 @@
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.57.4/+esm';
 import { SUPABASE_URL, SUPABASE_ANON_KEY } from './config.js';
-import { todayStr, fmtDate, dueInfo, rollForward, FREQUENCIES } from './dates.js';
+import { todayStr, fmtDate, dueInfo, rollForward, daysBetween, FREQUENCIES } from './dates.js';
+import { parseCapture, AREAS } from './parse.js';
 
 const TYPES = ['Inbox', 'Action', 'Project', 'Idea', 'Responsibility'];
+const CAPTURE_TYPES = ['Inbox', 'Action', 'Work', 'Project', 'Idea', 'Responsibility'];
 const STAGES = ['New', 'Seed', 'Exploring', 'Planned', 'Ready', 'Active', 'Waiting'];
 const PRIORITIES = ['Critical', 'High', 'Normal', 'Low', 'Someday'];
-const AREAS = ['Home', 'Health', 'Finance', 'Family', 'Projects'];
-const LISTS = ['Actions', 'Focus', 'Waiting', 'Responsibilities', 'Ideas', 'Completed'];
+const LISTS = ['Actions', 'Work', 'Focus', 'Waiting', 'Responsibilities', 'Ideas', 'Completed'];
 const TEXT_FIELDS = ['title', 'next_action', 'waiting_on', 'desired_outcome', 'plan', 'interval_days'];
 const LOCK_AFTER_MS = 10 * 60 * 1000;
 const MAX_PIN_TRIES = 5;
@@ -19,6 +20,7 @@ const ICON = {
   today: '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>',
   inbox: '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.5 5h13L22 12v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-6z"/></svg>',
   projects: '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>',
+  x: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>',
   more: '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>',
 };
 
@@ -38,6 +40,9 @@ const S = {
   pinMsg: '',
   captureKey: null,
   saving: 0,
+  jots: [], // today's pad
+  note: null, // { day, body, version } for today's daily note; version 0 = not saved yet
+  padDay: null,
 };
 
 const app = document.getElementById('app');
@@ -77,6 +82,136 @@ async function loadItems() {
   if (error) { toast('Could not load: ' + error.message); return; }
   S.items = data;
   refresh();
+}
+
+function loadAll() {
+  loadItems();
+  loadPad();
+  loadNote();
+}
+
+// ---------- today's pad ----------
+
+// Loads today's jots. Unfinished jots from earlier days move to today, remembering the day they were first written.
+async function loadPad() {
+  const today = todayStr();
+  const { data, error } = await sb.from('pad_jots').select('*')
+    .is('cleared_at', null).is('removed_at', null)
+    .or(`day.eq.${today},and(day.lt.${today},done.eq.false)`)
+    .order('created_at');
+  if (error) { toast('Could not load the pad: ' + error.message); return; }
+  const stale = data.filter((j) => j.day < today);
+  for (const j of stale) { j.carried_from = j.carried_from || j.day; j.day = today; }
+  S.jots = data;
+  S.padDay = today;
+  refresh();
+  const results = await Promise.all(stale.map((j) =>
+    sb.from('pad_jots').update({ day: today, carried_from: j.carried_from }).eq('id', j.id)));
+  const failed = results.find((x) => x.error);
+  if (failed) toast('Could not carry over the pad: ' + failed.error.message);
+}
+
+function jotById(id) { return S.jots.find((j) => j.id === id); }
+
+async function saveJot(id, changes) {
+  const j = jotById(id);
+  if (j) Object.assign(j, changes);
+  refresh();
+  if (String(id).startsWith('tmp-')) return;
+  const { error } = await sb.from('pad_jots').update(changes).eq('id', id);
+  if (error) { toast('Could not save the pad: ' + error.message); loadPad(); }
+}
+
+async function addJot(text) {
+  const tmp = { id: 'tmp-' + Date.now(), day: todayStr(), text, done: false, carried_from: null };
+  S.jots.push(tmp);
+  refresh();
+  const { data, error } = await sb.from('pad_jots').insert({ day: tmp.day, text }).select().single();
+  S.jots = S.jots.filter((j) => j.id !== tmp.id);
+  if (error) { refresh(); toast('Could not add to the pad: ' + error.message); return false; }
+  S.jots.push(data);
+  refresh();
+  return true;
+}
+
+function removeJot(id) {
+  saveJot(id, { removed_at: new Date().toISOString() });
+  S.jots = S.jots.filter((j) => j.id !== id);
+  refresh();
+}
+
+async function jotToAction(id) {
+  const j = jotById(id);
+  if (!j || String(id).startsWith('tmp-')) return;
+  const p = parseCapture(j.text, todayStr());
+  try {
+    await addItem(itemFields(p, 'Action'));
+    removeJot(id);
+    toast('Made into an action');
+  } catch (e) { toast('Could not make an action: ' + e.message); }
+}
+
+async function clearDoneJots() {
+  const done = S.jots.filter((j) => j.done && !String(j.id).startsWith('tmp-'));
+  if (!done.length) return;
+  const ids = done.map((j) => j.id);
+  S.jots = S.jots.filter((j) => !ids.includes(j.id));
+  refresh();
+  const { error } = await sb.from('pad_jots').update({ cleared_at: new Date().toISOString() }).in('id', ids);
+  if (error) { toast('Could not clear: ' + error.message); loadPad(); } else toast('Cleared ' + ids.length + ' done');
+}
+
+// ---------- daily note ----------
+
+async function loadNote() {
+  if (noteDirty) return; // don't overwrite text that hasn't saved yet
+  const day = todayStr();
+  const { data, error } = await sb.from('daily_notes').select('*').eq('day', day).maybeSingle();
+  if (error) { toast('Could not load the note: ' + error.message); return; }
+  S.note = data ? { day, body: data.body, version: data.version } : { day, body: '', version: 0 };
+  refresh();
+}
+
+// If another device saved the note first, keep both texts rather than losing either.
+function mergeText(mine, theirs) {
+  if (!theirs || mine.includes(theirs)) return mine;
+  if (!mine || theirs.includes(mine)) return theirs;
+  return theirs + '\n\n' + mine;
+}
+
+let noteDirty = false;
+let noteTimer;
+let noteChain = Promise.resolve();
+function queueNoteSave() {
+  clearTimeout(noteTimer);
+  if (!noteDirty) return;
+  noteDirty = false;
+  noteChain = noteChain.then(saveNote);
+}
+
+async function saveNote() {
+  const n = S.note;
+  if (!n) return;
+  setSaving(1);
+  const body = n.body;
+  let res;
+  if (n.version === 0) {
+    res = await sb.from('daily_notes').insert({ day: n.day, body }).select();
+  } else {
+    res = await sb.from('daily_notes').update({ body, version: n.version + 1, updated_at: new Date().toISOString() })
+      .eq('day', n.day).eq('version', n.version).select();
+  }
+  setSaving(-1);
+  if (res.error && res.error.code !== '23505') { toast('Could not save the note: ' + res.error.message); noteDirty = true; return; }
+  if (!res.error && res.data.length) { n.version = res.data[0].version; return; }
+  // Someone else saved first: merge, then save again on top of their version.
+  const { data: fresh } = await sb.from('daily_notes').select('*').eq('day', n.day).maybeSingle();
+  if (!fresh) { n.version = 0; noteDirty = true; queueNoteSave(); return; }
+  n.body = mergeText(n.body, fresh.body);
+  n.version = fresh.version;
+  if (n.body !== fresh.body) { noteDirty = true; queueNoteSave(); }
+  toast('Your note was also edited on another device. Both versions are kept.');
+  renderView();
 }
 
 // Saves run one at a time per item, and each update only lands if the row's
@@ -168,16 +303,27 @@ function setType(id, t) {
   patch(id, ch);
 }
 
+// Turns parsed quick-entry text plus a capture type into item fields.
+function itemFields(p, capType) {
+  const type = capType === 'Inbox' ? null : capType === 'Work' ? 'Action' : capType;
+  const f = { title: p.title, type, stage: type ? 'Ready' : 'New' };
+  if (p.next_due) f.next_due = p.next_due;
+  if (p.priority) f.priority = p.priority;
+  const area = p.area || (capType === 'Work' ? 'Work' : null);
+  if (area) f.area = area;
+  return f;
+}
+
 async function capture() {
   const input = $('#capInput');
   const title = input.value.trim();
   if (!title) return;
-  const type = S.capType === 'Inbox' ? null : S.capType;
+  const p = parseCapture(title, todayStr());
   input.value = '';
   localStorage.removeItem(DRAFT_KEY);
   try {
-    await addItem({ title, type, stage: type ? 'Ready' : 'New' });
-    toast('Saved to ' + S.capType);
+    await addItem(itemFields(p, S.capType));
+    toast('Saved to ' + S.capType + (p.next_due ? ', due ' + fmtDate(p.next_due) : '') + (p.priority ? ', ' + p.priority : ''));
   } catch (e) {
     input.value = title; // never lose typed text
     localStorage.setItem(DRAFT_KEY, title);
@@ -248,14 +394,18 @@ async function signOut(msg) {
 function enterMain() {
   S.screen = 'main';
   render();
-  loadItems();
+  loadAll();
+  // The Shortcut uses this to work out what "today" and "fri" mean.
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  if (tz) sb.from('user_settings').upsert({ user_id: S.session.user.id, time_zone: tz, updated_at: new Date().toISOString() })
+    .then(({ error }) => { if (error) console.warn('time zone not saved', error.message); });
 }
 
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) { sessionStorage.setItem('pos.hiddenAt', String(Date.now())); return; }
   const at = Number(sessionStorage.getItem('pos.hiddenAt') || 0);
   if (at && Date.now() - at > LOCK_AFTER_MS) lock();
-  else if (S.screen === 'main') loadItems();
+  else if (S.screen === 'main') { flushText(); loadAll(); }
 });
 
 // ---------- rendering ----------
@@ -290,12 +440,13 @@ function card(rows, empty, extraCls = '') {
 function lists() {
   const open = S.items.filter(isOpen);
   return {
-    Actions: open.filter((x) => x.type === 'Action' && !x.parent_id).sort(byUrgency),
+    Actions: open.filter((x) => x.type === 'Action' && !x.parent_id && x.area !== 'Work').sort(byUrgency),
+    Work: open.filter((x) => x.area === 'Work').sort(byUrgency),
     Focus: open.filter((x) => x.focus).sort(byUrgency),
     Waiting: open.filter((x) => x.stage === 'Waiting').sort(byUrgency),
     Responsibilities: open.filter((x) => x.type === 'Responsibility').sort(byUrgency),
     Ideas: open.filter((x) => x.type === 'Idea'),
-    Completed: S.items.filter((x) => !isOpen(x)).sort((a, b) => (b.completed_date || '').localeCompare(a.completed_date || '')),
+    Completed: S.items.filter((x) => !isOpen(x) && !x.cleared_at).sort((a, b) => (b.completed_date || '').localeCompare(a.completed_date || '')),
   };
 }
 
@@ -332,10 +483,40 @@ function viewToday() {
     <h1 class="h1">${esc(headline)}</h1>
     <div class="sec attn">Needs attention<span>${n}</span></div>
     ${card(attn.map((x) => row(x)), 'All clear.', 'attn-card')}
+    ${padSection(today)}
     <div class="sec">In focus<span>${focus.length}</span></div>
     <div class="stack">${focusCards.length ? focusCards.join('') : '<div class="card"><div class="empty">Tap Focus on an item to pin it here.</div></div>'}</div>
     <div class="sec">Coming up, next 14 days<span>${coming.length}</span></div>
-    ${card(coming.map((x) => row(x)), 'Nothing due in the next two weeks.')}`;
+    ${card(coming.map((x) => row(x)), 'Nothing due in the next two weeks.')}
+    <div class="sec"><label for="noteInput">Today's note</label><span>${S.note && S.note.body ? '' : 'autosaves'}</span></div>
+    <textarea id="noteInput" class="input note" rows="5" placeholder="Anything worth remembering about today..." ${S.note ? '' : 'disabled'}>${esc(S.note ? S.note.body : '')}</textarea>`;
+}
+
+function carriedLabel(from, today) {
+  const n = daysBetween(from, today);
+  if (n === 1) return 'from yesterday';
+  if (n < 7) return 'from ' + new Date(from + 'T12:00:00').toLocaleDateString(undefined, { weekday: 'short' });
+  return 'from ' + fmtDate(from);
+}
+
+function padSection(today) {
+  const jots = [...S.jots].sort((a, b) => a.done - b.done); // done ones sink to the bottom
+  const doneCount = jots.filter((j) => j.done).length;
+  const rows = jots.map((j) => `<div class="row jot ${j.done ? 'done' : ''}">
+    <button class="chk ${j.done ? 'on' : ''}" data-act="jotdone" data-id="${j.id}" aria-label="${j.done ? 'Not done' : 'Done'}">${j.done ? ICON.check : ''}</button>
+    <span class="rbody"><span class="rt">${esc(j.text)}</span>${j.carried_from ? `<span class="rmeta"><span class="chip carried">${esc(carriedLabel(j.carried_from, today))}</span></span>` : ''}</span>
+    ${j.done ? '' : `<button class="mini" data-act="jotaction" data-id="${j.id}">Make action</button>`}
+    <button class="mini x" data-act="jotremove" data-id="${j.id}" aria-label="Remove">${ICON.x}</button>
+  </div>`);
+  return `<div class="sec">Today's pad<span>${doneCount ? `<button class="link sm" data-act="jotclear">Clear ${doneCount} done</button>` : S.jots.length}</span></div>
+    <div class="card">
+      ${rows.join('')}
+      <form id="jotForm" class="jotform" autocomplete="off">
+        <label for="jotInput" class="sr">Add to today's pad</label>
+        <input id="jotInput" class="input" placeholder="Add to today's pad..." enterkeyhint="done">
+        <button class="btn" type="submit">Add</button>
+      </form>
+    </div>`;
 }
 
 function viewInbox() {
@@ -386,8 +567,10 @@ function viewMore() {
 
 function viewList() {
   const items = lists()[S.listKind] || [];
+  const clear = S.listKind === 'Completed' && items.length ? '<button class="link" data-act="clearcompleted">Clear completed</button>' : '';
+  const hint = S.listKind === 'Work' ? '<p class="hint">Work things you thought of away from the office. Capture with Save as Work, or end a jot with #work.</p>' : '';
   return `<button class="link" data-act="go" data-v="more">‹ More</button>
-    <h1 class="h1">${esc(S.listKind)}</h1>
+    <div class="lhead"><h1 class="h1">${esc(S.listKind)}</h1>${clear}</div>${hint}
     ${card(items.map((x) => row(x, { showStage: true })), 'Nothing here.')}`;
 }
 
@@ -395,8 +578,18 @@ function renderView() {
   const el = $('#view');
   if (!el) return;
   const top = el.scrollTop;
+  const active = document.activeElement && el.contains(document.activeElement) ? document.activeElement : null;
+  const keep = active && active.id ? { id: active.id, value: active.value, start: active.selectionStart, end: active.selectionEnd } : null;
   const views = { today: viewToday, inbox: viewInbox, projects: viewProjects, more: viewMore, list: viewList };
   el.innerHTML = (views[S.view] || viewToday)();
+  if (keep) {
+    const again = el.querySelector('#' + keep.id);
+    if (again) {
+      if (keep.id === 'jotInput') again.value = keep.value;
+      again.focus({ preventScroll: true });
+      try { again.setSelectionRange(keep.start, keep.end); } catch { /* not a text field */ }
+    }
+  }
   el.scrollTop = top;
 }
 
@@ -416,7 +609,7 @@ function renderTabs() {
 function renderPills() {
   const el = $('#pills');
   if (!el) return;
-  el.innerHTML = '<span class="mono saveas">SAVE AS</span>' + TYPES.map((t) =>
+  el.innerHTML = '<span class="mono saveas">SAVE AS</span>' + CAPTURE_TYPES.map((t) =>
     `<button type="button" class="pill sm ${t === S.capType ? 'on' : ''}" data-act="captype" data-v="${t}">${t}</button>`).join('');
 }
 
@@ -527,7 +720,7 @@ function render() {
         <button class="xbtn" data-act="lock" aria-label="Lock app">${ICON.lock}</button></div>
       <form id="capForm" class="capture" autocomplete="off">
         <label for="capInput" class="sr">Quick capture</label>
-        <input id="capInput" class="input" placeholder="Capture anything..." enterkeyhint="done">
+        <input id="capInput" class="input" placeholder="Capture, e.g. Dentist fri !high" enterkeyhint="done">
         <button class="btn pri" type="submit">Save</button>
       </form>
       <div id="pills" class="hscroll"></div>
@@ -559,6 +752,19 @@ app.addEventListener('click', async (e) => {
     case 'focus': patch(id, { focus: !byId(id).focus }); break;
     case 'wait': patch(id, { stage: byId(id).stage === 'Waiting' ? 'Active' : 'Waiting' }); break;
     case 'delete': deleteItem(id); break;
+    case 'jotdone': saveJot(id, { done: !jotById(id).done }); break;
+    case 'jotremove': removeJot(id); break;
+    case 'jotaction': jotToAction(id); break;
+    case 'jotclear': clearDoneJots(); break;
+    case 'clearcompleted': {
+      const done = lists().Completed;
+      if (!confirm('Hide ' + done.length + ' completed item' + (done.length === 1 ? '' : 's') + ' from this list? They stay in project progress.')) break;
+      const now = new Date().toISOString();
+      done.forEach((x) => patch(x.id, { cleared_at: now }, { rerender: false }));
+      refresh();
+      toast('Cleared');
+      break;
+    }
     case 'settype': setType(S.sheetId, v); break;
     case 'set': patch(S.sheetId, { [k]: v || null }); break;
     case 'lock': lock(); break;
@@ -581,6 +787,14 @@ app.addEventListener('click', async (e) => {
 app.addEventListener('submit', async (e) => {
   e.preventDefault();
   if (e.target.id === 'capForm') { capture(); return; }
+  if (e.target.id === 'jotForm') {
+    const input = $('#jotInput');
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = '';
+    if (!(await addJot(text))) input.value = text; // never lose typed text
+    return;
+  }
   if (e.target.id === 'loginForm') {
     const email = $('#email').value.trim();
     const password = $('#password').value;
@@ -593,6 +807,7 @@ app.addEventListener('submit', async (e) => {
 const pendingText = {};
 let textTimer;
 function flushText() {
+  queueNoteSave();
   clearTimeout(textTimer);
   for (const key of Object.keys(pendingText)) {
     const [id, field] = key.split('|');
@@ -608,6 +823,13 @@ function flushText() {
 app.addEventListener('input', (e) => {
   const t = e.target;
   if (t.id === 'capInput') { localStorage.setItem(DRAFT_KEY, t.value); return; }
+  if (t.id === 'noteInput' && S.note) {
+    S.note.body = t.value;
+    noteDirty = true;
+    clearTimeout(noteTimer);
+    noteTimer = setTimeout(queueNoteSave, 700);
+    return;
+  }
   const field = t.dataset.field;
   if (!field || !TEXT_FIELDS.includes(field) || !S.sheetId) return;
   pendingText[S.sheetId + '|' + field] = t.value;
@@ -617,7 +839,7 @@ app.addEventListener('input', (e) => {
   textTimer = setTimeout(flushText, 700);
 });
 
-app.addEventListener('focusout', (e) => { if (e.target.dataset?.field) flushText(); });
+app.addEventListener('focusout', (e) => { if (e.target.dataset?.field || e.target.id === 'noteInput') flushText(); });
 window.addEventListener('pagehide', flushText);
 
 app.addEventListener('change', (e) => {
